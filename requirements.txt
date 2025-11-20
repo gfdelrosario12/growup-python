@@ -1,4 +1,7 @@
-ultralytics==8.1.0       # YOLOv8 library
-opencv-python>=4.7.0
-Pillow>=10.0.0
-numpy>=1.24.0
+opencv-python-headless==4.5.4.58
+torch==1.10.0
+torchvision==0.11.1
+ultralytics==8.0.100
+paho-mqtt==1.5.0
+websockets==10.2
+RPi.GPIO==0.7.0 
