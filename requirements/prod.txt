@@ -1,0 +1,28 @@
+# GrowUp IoT System - Production Requirements (Raspberry Pi)
+# Install: pip install -r requirements/prod.txt
+
+# Include base requirements
+-r base.txt
+
+# Raspberry Pi Hardware
+RPi.GPIO==0.7.1
+spidev==3.6
+
+# Sensor Libraries (install on Raspberry Pi)
+# Uncomment the sensors you have connected:
+# adafruit-circuitpython-bme280==2.6.21      # BME280 temp/humidity sensor
+# adafruit-circuitpython-bh1750==1.1.18      # BH1750 light sensor
+# adafruit-circuitpython-ads1x15==2.2.21     # ADS1115 ADC for analog sensors
+# w1thermsensor==2.0.0                       # DS18B20 temp sensor (1-wire)
+
+# Camera & Computer Vision
+opencv-python==4.8.1.78
+
+# Machine Learning (YOLO)
+ultralytics==8.0.196
+
+# Performance
+uvloop==0.19.0  # Faster event loop
+
+# Note: For GUI (lcd_viewer.py), install tkinter:
+# sudo apt-get install python3-tk
