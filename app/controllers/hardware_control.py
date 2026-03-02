@@ -45,7 +45,7 @@ except (ImportError, RuntimeError):
     GPIO = MockGPIO()
     print("⚠️  RPi.GPIO not available - using mock GPIO for development")
 
-from config import GPIO_PINS, RELAY_ACTIVE_HIGH, DEFAULT_CONTROLS, LOG_CONTROL_CHANGES
+from app.utils.config import GPIO_PINS, RELAY_ACTIVE_HIGH, DEFAULT_CONTROLS, LOG_CONTROL_CHANGES
 
 class HardwareController:
     """Controls hardware via GPIO pins"""

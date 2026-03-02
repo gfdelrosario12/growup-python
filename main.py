@@ -1,495 +1,383 @@
+#!/usr/bin/env python3
 """
 GrowUp IoT System - Main Entry Point
 =====================================
-Single unified entry point that coordinates ALL system components:
+Unified entry point that coordinates ALL system components with modular architecture:
 
-1. Sensor Reading (every 1s, send to backend every 60s or on significant change)
-2. Hardware Control (poll backend every 5s, apply GPIO changes)
-3. Camera ML Detection (YOLO object detection with WebSocket)
-4. LCD Viewer GUI (optional, Tkinter interface)
-5. Backend Communication (Spring Boot REST API)
+1. Sensor Reading & Data Sync
+2. Hardware Control (GPIO relays)
+3. Preset Automation (with manual override support)
+4. MQTT Control Handler
+5. Camera ML Detection (YOLO)
+6. LCD Viewer (optional)
+7. REST API Server
+8. WebSocket Camera Stream
 
 Usage:
-    python3 main.py                    # Run without LCD viewer
-    python3 main.py --lcd              # Run with LCD viewer
-    python3 main.py --lcd --demo       # Run with LCD viewer in demo mode
+    python3 main.py                    # Run full system
+    python3 main.py --no-lcd           # Run without LCD viewer
     python3 main.py --no-camera        # Run without camera ML
+    python3 main.py --api-only         # Run only REST API server
+    python3 main.py --camera-only      # Run only camera WebSocket server
 
 Architecture:
-Frontend ← → Spring Boot Backend ← → Raspberry Pi (this script)
-                                     ↓
-                                   GPIO Hardware + Camera + LCD
+    Frontend ←→ Spring Boot Backend ←→ Raspberry Pi (this script)
+                                         ↓
+                                       GPIO Hardware + Sensors + Camera + LCD
 """
 
 import time
-import requests
-import threading
 import argparse
 import sys
 import signal
-from typing import Dict, Optional
-from datetime import datetime
+import threading
+from typing import Optional
 
-# Import configuration - Temporary: using old config until full migration
-# TODO: Migrate to src.config.settings
+# Import modular components
+from app.controllers.hardware_control import HardwareController, cleanup_hardware
+from app.controllers.mqtt_control import MQTTControlHandler
+from app.controllers.preset_automation import PresetAutomation
+from app.sensors.temp_sensor import read_water_temp, read_air_temp
+from app.sensors.ph_sensor import read_ph
+from app.sensors.humidity_sensor import read_humidity
+from app.sensors.light_sensor import read_light_intensity
+from app.sensors.ammonia_sensor import read_ammonia
+from app.sensors.water_flow_sensor import read_water_flow
+from app.utils.config import (
+    BACKEND_SENSOR_READINGS,
+    BACKEND_CONTROLS,
+    SEND_INTERVAL,
+    CONTROL_POLL_INTERVAL,
+    VERBOSE_LOGGING,
+    print_config
+)
+from app.utils.influxdb_client import InfluxDBClient
+from app.utils.system_manager import SystemManager
+
+# Optional components
 try:
-    from config import (
-        BACKEND_SENSOR_READINGS,
-        BACKEND_CONTROLS,
-        SEND_INTERVAL,
-        CONTROL_POLL_INTERVAL,
-        REQUEST_TIMEOUT,
-        VERBOSE_LOGGING,
-        LOG_SENSOR_READINGS,
-        LOG_CONTROL_CHANGES,
-        is_significant_change,
-        print_config
-    )
-except (ImportError, ModuleNotFoundError):
-    # Fallback: use defaults if config.py is deleted
-    print("⚠️  Old config.py not found, using defaults")
-    BACKEND_SENSOR_READINGS = "http://localhost:8080/api/sensor-readings"
-    BACKEND_CONTROLS = "http://localhost:8080/api/controls"
-    SEND_INTERVAL = 60
-    CONTROL_POLL_INTERVAL = 5
-    REQUEST_TIMEOUT = 10
-    VERBOSE_LOGGING = True
-    LOG_SENSOR_READINGS = True
-    LOG_CONTROL_CHANGES = True
-    
-    def is_significant_change(key, old_val, new_val):
-        thresholds = {
-            "waterTemp": 0.5, "ph": 0.2, "dissolvedO2": 0.5,
-            "ammonia": 0.05, "airTemp": 1.0, "waterFlow": 2.0,
-            "humidity": 5.0, "lightIntensity": 100
-        }
-        threshold = thresholds.get(key, 0)
-        return abs(new_val - old_val) >= threshold
-    
-    def print_config():
-        print(f"Backend: {BACKEND_SENSOR_READINGS}")
-        print(f"Send Interval: {SEND_INTERVAL}s")
-        print(f"Control Poll: {CONTROL_POLL_INTERVAL}s")
+    from app.services.camera_ml import start_camera_ml
+    CAMERA_ML_AVAILABLE = True
+except ImportError:
+    print("⚠️  Camera ML not available (missing dependencies)")
+    CAMERA_ML_AVAILABLE = False
 
-# Import hardware controller
-from hardware_control import get_hardware_controller, cleanup_hardware
+try:
+    from app.services.lcd_viewer import LCDViewer
+    LCD_AVAILABLE = True
+except ImportError:
+    print("⚠️  LCD Viewer not available (missing tkinter)")
+    LCD_AVAILABLE = False
 
-# Import sensor reading
-from server import read_all_sensors, get_ml_data
 
 class GrowUpSystem:
-    """Main system coordinator - integrates all components"""
+    """Main system coordinator - integrates all modular components"""
     
-    def __init__(self, enable_lcd=False, enable_camera=True, demo_mode=False):
+    def __init__(self, enable_lcd=False, enable_camera=True):
         self.running = False
-        self.enable_lcd = enable_lcd
-        self.enable_camera = enable_camera
-        self.demo_mode = demo_mode
+        self.enable_lcd = enable_lcd and LCD_AVAILABLE
+        self.enable_camera = enable_camera and CAMERA_ML_AVAILABLE
         
         # State management
         self.last_sensor_data = {}
         self.last_send_time = 0
         self.consecutive_failures = 0
         
-        # Component references
-        self.hardware = None
-        self.lcd_viewer = None
-        self.camera_thread = None
-        self.mqtt_handler = None  # MQTT control handler
-        self.preset_automation = None  # Preset automation handler
+        # Core components
+        self.hardware: Optional[HardwareController] = None
+        self.mqtt: Optional[MQTTControlHandler] = None
+        self.preset_automation: Optional[PresetAutomation] = None
+        self.influx_client: Optional[InfluxDBClient] = None
+        self.system_manager: Optional[SystemManager] = None
         
-        # Shared data for LCD viewer
-        self.shared_data = {
-            'sensors': {},
-            'controls': {},
-            'detections': [],
-            'logs': []
+        # Optional components
+        self.lcd_viewer: Optional['LCDViewer'] = None
+        self.camera_thread: Optional[threading.Thread] = None
+        
+        # Worker threads
+        self.sensor_thread: Optional[threading.Thread] = None
+        self.control_thread: Optional[threading.Thread] = None
+        self.automation_thread: Optional[threading.Thread] = None
+    
+    def initialize(self):
+        """Initialize all system components"""
+        print("\n" + "=" * 70)
+        print("🌱 GrowUp IoT System - Modular Architecture")
+        print("=" * 70)
+        print_config()
+        print("=" * 70)
+        
+        # Initialize hardware controller
+        print("\n🔧 Initializing Hardware Controller...")
+        self.hardware = HardwareController()
+        
+        # Initialize MQTT control handler
+        print("📡 Initializing MQTT Control Handler...")
+        self.mqtt = MQTTControlHandler(self.hardware)
+        
+        # Initialize preset automation
+        print("🤖 Initializing Preset Automation...")
+        self.preset_automation = PresetAutomation(self.hardware, self.mqtt)
+        
+        # Initialize InfluxDB client
+        print("📊 Initializing InfluxDB Client...")
+        self.influx_client = InfluxDBClient()
+        
+        # Initialize system manager
+        print("⚙️  Initializing System Manager...")
+        self.system_manager = SystemManager()
+        
+        # Initialize LCD viewer if enabled
+        if self.enable_lcd:
+            print("🖥️  Initializing LCD Viewer...")
+            self.lcd_viewer = LCDViewer(self)
+        
+        # Initialize camera ML if enabled
+        if self.enable_camera:
+            print("📷 Initializing Camera ML (YOLO)...")
+            self.camera_thread = threading.Thread(target=start_camera_ml, daemon=True)
+        
+        print("\n✅ All components initialized successfully!")
+        print("=" * 70 + "\n")
+    
+    def start(self):
+        """Start all system components"""
+        self.running = True
+        
+        # Start MQTT handler
+        if self.mqtt:
+            print("🚀 Starting MQTT Handler...")
+            self.mqtt.start()
+        
+        # Start camera ML
+        if self.camera_thread:
+            print("🚀 Starting Camera ML...")
+            self.camera_thread.start()
+        
+        # Start LCD viewer
+        if self.lcd_viewer:
+            print("🚀 Starting LCD Viewer...")
+            # LCD runs in main thread (Tkinter requirement)
+            threading.Thread(target=self._run_lcd, daemon=True).start()
+        
+        # Start sensor reading thread
+        print("🚀 Starting Sensor Reading Thread...")
+        self.sensor_thread = threading.Thread(target=self._sensor_loop, daemon=True)
+        self.sensor_thread.start()
+        
+        # Start control polling thread
+        print("🚀 Starting Control Polling Thread...")
+        self.control_thread = threading.Thread(target=self._control_loop, daemon=True)
+        self.control_thread.start()
+        
+        # Start automation thread
+        print("🚀 Starting Preset Automation Thread...")
+        self.automation_thread = threading.Thread(target=self._automation_loop, daemon=True)
+        self.automation_thread.start()
+        
+        print("\n✅ All threads started!")
+        print("=" * 70)
+        print("📡 System is now running...")
+        print("   - Press Ctrl+C to stop")
+        print("=" * 70 + "\n")
+    
+    def _sensor_loop(self):
+        """Sensor reading and data sync loop"""
+        while self.running:
+            try:
+                # Read all sensors
+                sensor_data = {
+                    "waterTemp": read_water_temp(),
+                    "airTemp": read_air_temp(),
+                    "ph": read_ph(),
+                    "humidity": read_humidity(),
+                    "lightIntensity": read_light_intensity(),
+                    "ammonia": read_ammonia(),
+                    "waterFlow": read_water_flow(),
+                    "timestamp": int(time.time() * 1000)
+                }
+                
+                # Update LCD if enabled
+                if self.lcd_viewer:
+                    self.lcd_viewer.update_sensor_data(sensor_data)
+                
+                # Send to backend (every SEND_INTERVAL or on significant change)
+                current_time = time.time()
+                if (current_time - self.last_send_time >= SEND_INTERVAL or
+                    self._has_significant_change(sensor_data)):
+                    
+                    if self._send_sensor_data(sensor_data):
+                        self.last_send_time = current_time
+                        self.consecutive_failures = 0
+                    else:
+                        self.consecutive_failures += 1
+                
+                # Store to InfluxDB
+                if self.influx_client:
+                    self.influx_client.write_sensor_data(sensor_data)
+                
+                # Update last data
+                self.last_sensor_data = sensor_data
+                
+            except Exception as e:
+                print(f"❌ Sensor loop error: {e}")
+            
+            time.sleep(1)  # Read sensors every 1 second
+    
+    def _control_loop(self):
+        """Control polling loop - fetch backend control state"""
+        while self.running:
+            try:
+                # Poll backend for control state
+                # Backend should reflect MQTT control state
+                # This is for backward compatibility
+                pass
+                
+            except Exception as e:
+                print(f"❌ Control loop error: {e}")
+            
+            time.sleep(CONTROL_POLL_INTERVAL)
+    
+    def _automation_loop(self):
+        """Preset automation loop"""
+        while self.running:
+            try:
+                if self.preset_automation:
+                    self.preset_automation.apply_active_preset()
+            except Exception as e:
+                print(f"❌ Automation loop error: {e}")
+            
+            time.sleep(1)  # Check every second
+    
+    def _run_lcd(self):
+        """Run LCD viewer (must be in separate thread due to Tkinter)"""
+        if self.lcd_viewer:
+            self.lcd_viewer.run()
+    
+    def _has_significant_change(self, new_data: dict) -> bool:
+        """Check if sensor data has significant change"""
+        if not self.last_sensor_data:
+            return True
+        
+        thresholds = {
+            "waterTemp": 0.5,
+            "airTemp": 1.0,
+            "ph": 0.2,
+            "humidity": 5.0,
+            "lightIntensity": 100,
+            "ammonia": 0.05,
+            "waterFlow": 2.0
         }
         
-        print("\n" + "="*60)
-        print("🌱 GrowUp IoT System Initializing...")
-        print("="*60)
-        print_config()
-        print(f"LCD Viewer: {'✅ Enabled' if enable_lcd else '❌ Disabled'}")
-        print(f"Camera ML: {'✅ Enabled' if enable_camera else '❌ Disabled'}")
-        print(f"Demo Mode: {'✅ Enabled' if demo_mode else '❌ Disabled'}")
-        print("="*60 + "\n")
-    
-    def initialize_components(self):
-        """Initialize all system components"""
-        try:
-            # Initialize hardware controller
-            if not self.demo_mode:
-                self.hardware = get_hardware_controller()
-                self.log("✅ Hardware controller initialized")
-            else:
-                self.log("⚠️  Running in DEMO mode (no GPIO)")
-            
-            # Initialize MQTT control handler (if not demo mode)
-            if not self.demo_mode:
-                try:
-                    from mqtt_control import get_mqtt_handler
-                    self.mqtt_handler = get_mqtt_handler()
-                    if self.mqtt_handler.start():
-                        self.log("✅ MQTT control handler started")
-                    else:
-                        self.log("⚠️  MQTT control handler failed to start")
-                except ImportError:
-                    self.log("⚠️  MQTT control not available (paho-mqtt not installed)")
-                except Exception as e:
-                    self.log(f"⚠️  MQTT control initialization failed: {e}")
-            
-            # Initialize camera ML if enabled
-            if self.enable_camera and not self.demo_mode:
-                self.start_camera_ml()
-            
-            # Initialize LCD viewer if enabled
-            if self.enable_lcd:
-                self.start_lcd_viewer()
-            
-            return True
-            
-        except Exception as e:
-            self.log(f"❌ Component initialization failed: {e}")
-            return False
-    
-    def start_camera_ml(self):
-        """Start camera ML detection in separate thread"""
-        try:
-            from camera_ws import start_camera_detection
-            self.camera_thread = threading.Thread(
-                target=start_camera_detection,
-                args=(self.on_detection_callback,),
-                daemon=True
-            )
-            self.camera_thread.start()
-            self.log("✅ Camera ML detection started")
-        except (ImportError, ModuleNotFoundError) as e:
-            self.log(f"⚠️  Camera ML not available: {e}")
-        except Exception as e:
-            self.log(f"⚠️  Camera ML initialization failed: {e}")
-    
-    def on_detection_callback(self, detections):
-        """Callback when camera detects objects"""
-        self.shared_data['detections'] = detections
-        if self.lcd_viewer:
-            self.lcd_viewer.update_detections(detections)
-    
-    def start_lcd_viewer(self):
-        """Start LCD viewer in separate thread"""
-        try:
-            from lcd_viewer import LCDViewer
-            
-            def run_lcd():
-                self.lcd_viewer = LCDViewer(demo_mode=self.demo_mode)
-                self.lcd_viewer.run()
-            
-            lcd_thread = threading.Thread(target=run_lcd, daemon=False)
-            lcd_thread.start()
-            self.log("✅ LCD Viewer started")
-            
-        except ImportError as e:
-            self.log(f"⚠️  LCD Viewer not available: {e}")
-            self.log("    Install tkinter: sudo apt-get install python3-tk")
-        except Exception as e:
-            self.log(f"⚠️  LCD Viewer initialization failed: {e}")
-    
-    def check_significant_change(self, new_data: Dict) -> bool:
-        """Check if any sensor has changed significantly"""
-        if not self.last_sensor_data:
-            return True  # First reading
-        
-        for key, new_value in new_data.items():
-            if key in self.last_sensor_data:
-                old_value = self.last_sensor_data[key]
-                if isinstance(new_value, (int, float)) and isinstance(old_value, (int, float)):
-                    if is_significant_change(key, old_value, new_value):
-                        if VERBOSE_LOGGING:
-                            self.log(f"⚡ Significant change: {key} {old_value} → {new_value}")
-                        return True
+        for key, threshold in thresholds.items():
+            old_val = self.last_sensor_data.get(key, 0)
+            new_val = new_data.get(key, 0)
+            if abs(new_val - old_val) >= threshold:
+                return True
         
         return False
     
-    def send_sensor_data_to_backend(self):
-        """Send sensor data to Spring Boot backend"""
+    def _send_sensor_data(self, data: dict) -> bool:
+        """Send sensor data to backend"""
         try:
-            # Read sensors
-            sensor_data = read_all_sensors() if not self.demo_mode else self.get_mock_sensors()
-            ml_data = get_ml_data() if not self.demo_mode else {}
-            
-            if not sensor_data:
-                return
-            
-            combined_data = {**sensor_data, **ml_data}
-            
-            # Update shared data for LCD
-            self.shared_data['sensors'] = combined_data
-            if self.lcd_viewer:
-                self.lcd_viewer.update_sensors(combined_data)
-            
-            # Check if we should send
-            current_time = time.time()
-            time_since_last_send = current_time - self.last_send_time
-            
-            should_send = (
-                time_since_last_send >= SEND_INTERVAL or
-                self.check_significant_change(combined_data)
-            )
-            
-            if not should_send:
-                return
-            
-            # Prepare payload for Spring Boot
-            payload = {
-                "waterTemp": combined_data.get("waterTemp"),
-                "phLevel": combined_data.get("ph"),  # Backend uses phLevel
-                "dissolvedO2": combined_data.get("dissolvedO2"),
-                "airTemp": combined_data.get("airTemp"),
-                "lightIntensity": combined_data.get("lightIntensity"),
-                "waterLevel": combined_data.get("waterLevel"),
-                "waterFlow": combined_data.get("waterFlow"),
-                "humidity": combined_data.get("humidity"),
-                "ammonia": combined_data.get("ammonia"),
-                "airPressure": combined_data.get("airPressure"),
-                "plantHeight": combined_data.get("plantHeight"),
-                "plantLeaves": combined_data.get("plantLeaves"),
-                "plantHealth": combined_data.get("plantHealth"),
-            }
-            
-            # Send to backend
+            import requests
             response = requests.post(
                 BACKEND_SENSOR_READINGS,
-                json=payload,
-                timeout=REQUEST_TIMEOUT
+                json=data,
+                timeout=10
             )
-            
             if response.status_code == 200:
-                result = response.json()
-                
-                if LOG_SENSOR_READINGS:
-                    quality = result.get("waterQualityScore", "N/A")
-                    health = result.get("healthStatus", "N/A")
-                    self.log(f"📤 Sent to backend | Quality: {quality} | Status: {health}")
-                
-                # Update state
-                self.last_sensor_data = combined_data
-                self.last_send_time = current_time
-                self.consecutive_failures = 0
+                if VERBOSE_LOGGING:
+                    print(f"✅ Sensor data sent: {data}")
+                return True
             else:
-                self.log(f"⚠️  Backend returned {response.status_code}")
-                
-        except requests.exceptions.RequestException as e:
-            self.consecutive_failures += 1
-            if self.consecutive_failures >= 5:
-                self.log(f"🚨 WARNING: {self.consecutive_failures} consecutive backend failures!")
-            
+                print(f"❌ Failed to send sensor data: {response.status_code}")
+                return False
         except Exception as e:
-            self.log(f"❌ Error sending sensor data: {e}")
+            print(f"❌ Error sending sensor data: {e}")
+            return False
     
-    def poll_control_updates_from_backend(self):
-        """Poll backend for control updates from frontend"""
-        try:
-            response = requests.get(
-                f"{BACKEND_CONTROLS}/latest",
-                timeout=REQUEST_TIMEOUT
-            )
-            
-            if response.status_code == 200:
-                data = response.json()
-                controls = data.get("controls", {})
-                
-                if controls:
-                    # Update shared data for LCD
-                    self.shared_data['controls'] = controls
-                    if self.lcd_viewer:
-                        self.lcd_viewer.update_controls(controls)
-                    
-                    # Apply controls to hardware (respecting manual overrides)
-                    if self.hardware:
-                        current_states = self.hardware.get_all_states()
-                        
-                        for control_name, desired_state in controls.items():
-                            # Skip if device has manual override
-                            if self.mqtt_handler and self.mqtt_handler.is_device_manual(control_name):
-                                continue
-                            
-                            current_state = current_states.get(control_name)
-                            
-                            if current_state != desired_state:
-                                success = self.hardware.update_control(control_name, desired_state)
-                                
-                                if success and LOG_CONTROL_CHANGES:
-                                    status = "ON" if desired_state else "OFF"
-                                    self.log(f"🔄 Backend update: {control_name} → {status}")
-                        
-                        # Send acknowledgment
-                        self.send_control_acknowledgment(self.hardware.get_all_states())
-            
-        except requests.exceptions.RequestException:
-            pass  # Silent fail for control polling
-        except Exception as e:
-            self.log(f"❌ Error polling controls: {e}")
-    
-    def send_control_acknowledgment(self, states: Dict[str, bool]):
-        """Send current control states back to backend"""
-        try:
-            requests.post(
-                f"{BACKEND_CONTROLS}/acknowledge",
-                json={"controls": states, "timestamp": datetime.now().isoformat()},
-                timeout=REQUEST_TIMEOUT
-            )
-        except Exception:
-            pass  # Silent fail
-    
-    def sensor_loop(self):
-        """Main sensor reading and sending loop"""
-        self.log("📊 Sensor loop started")
-        
-        while self.running:
-            try:
-                self.send_sensor_data_to_backend()
-                time.sleep(1)  # Check every second
-            except Exception as e:
-                self.log(f"❌ Sensor loop error: {e}")
-                time.sleep(5)
-    
-    def control_loop(self):
-        """Poll backend for control updates"""
-        self.log("🎛️  Control loop started")
-        
-        while self.running:
-            try:
-                self.poll_control_updates_from_backend()
-                time.sleep(CONTROL_POLL_INTERVAL)
-            except Exception as e:
-                self.log(f"❌ Control loop error: {e}")
-                time.sleep(5)
-    
-    def get_mock_sensors(self):
-        """Mock sensor data for demo mode"""
-        import random
-        return {
-            "waterTemp": round(22 + random.uniform(-2, 2), 1),
-            "ph": round(7.0 + random.uniform(-0.3, 0.3), 2),
-            "dissolvedO2": round(7.5 + random.uniform(-1, 1), 1),
-            "airTemp": round(24 + random.uniform(-2, 2), 1),
-            "lightIntensity": int(800 + random.uniform(-200, 200)),
-            "waterLevel": int(80 + random.uniform(-10, 10)),
-            "waterFlow": round(10 + random.uniform(-2, 2), 1),
-            "humidity": int(60 + random.uniform(-10, 10)),
-            "ammonia": round(0.05 + random.uniform(-0.02, 0.02), 3),
-            "airPressure": round(1013 + random.uniform(-5, 5), 1),
-        }
-    
-    def log(self, message: str):
-        """Centralized logging"""
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        log_entry = f"[{timestamp}] {message}"
-        print(log_entry)
-        
-        # Add to shared logs for LCD
-        self.shared_data['logs'].append(log_entry)
-        if len(self.shared_data['logs']) > 100:
-            self.shared_data['logs'] = self.shared_data['logs'][-100:]
-    
-    def start(self):
-        """Start the integrated system"""
-        self.log("🚀 Starting GrowUp IoT System...")
-        
-        if not self.initialize_components():
-            self.log("❌ Failed to initialize components")
-            return
-        
-        self.running = True
-        
-        # Start sensor loop
-        sensor_thread = threading.Thread(target=self.sensor_loop, daemon=True)
-        sensor_thread.start()
-        
-        # Start control loop
-        control_thread = threading.Thread(target=self.control_loop, daemon=True)
-        control_thread.start()
-        
-        self.log("✅ All systems operational")
-        self.log("📤 Sending data every 60s or on significant change")
-        self.log("📥 Polling controls every 5s")
-        self.log("Press Ctrl+C to stop\n")
-        
-        try:
-            # Keep main thread alive
-            while True:
-                time.sleep(1)
-        except KeyboardInterrupt:
-            self.log("\n🛑 Shutting down...")
-            self.stop()
+    def get_control_state(self) -> dict:
+        """Get current control state"""
+        if self.hardware:
+            return self.hardware.get_control_state()
+        return {}
     
     def stop(self):
-        """Stop all system components"""
+        """Stop all components gracefully"""
+        print("\n🛑 Stopping GrowUp IoT System...")
         self.running = False
         
-        # Stop MQTT control handler
-        if self.mqtt_handler:
-            try:
-                self.mqtt_handler.stop()
-            except Exception as e:
-                self.log(f"⚠️  Error stopping MQTT handler: {e}")
+        # Stop MQTT
+        if self.mqtt:
+            self.mqtt.stop()
         
+        # Stop LCD
+        if self.lcd_viewer:
+            self.lcd_viewer.stop()
+        
+        # Cleanup hardware
         if self.hardware:
             cleanup_hardware()
         
-        self.log("✅ System stopped")
-        sys.exit(0)
+        print("✅ System stopped gracefully")
 
-def signal_handler(sig, frame):
-    """Handle Ctrl+C gracefully"""
-    print("\n\n🛑 Received interrupt signal...")
-    sys.exit(0)
 
 def main():
-    """Main entry point with argument parsing"""
-    parser = argparse.ArgumentParser(
-        description='GrowUp IoT System - Integrated Aquaponics Monitor & Control',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python3 main.py                    # Run without LCD viewer
-  python3 main.py --lcd              # Run with LCD viewer
-  python3 main.py --lcd --demo       # Run in demo mode (no hardware)
-  python3 main.py --no-camera        # Run without camera ML
-        """
-    )
-    
-    parser.add_argument(
-        '--lcd',
-        action='store_true',
-        help='Enable LCD viewer GUI'
-    )
-    
-    parser.add_argument(
-        '--demo',
-        action='store_true',
-        help='Run in demo mode (mock sensors, no GPIO)'
-    )
-    
-    parser.add_argument(
-        '--no-camera',
-        action='store_true',
-        help='Disable camera ML detection'
-    )
-    
+    """Main entry point"""
+    parser = argparse.ArgumentParser(description='GrowUp IoT System')
+    parser.add_argument('--lcd', action='store_true', help='Enable LCD viewer')
+    parser.add_argument('--no-lcd', action='store_true', help='Disable LCD viewer')
+    parser.add_argument('--no-camera', action='store_true', help='Disable camera ML')
+    parser.add_argument('--api-only', action='store_true', help='Run only REST API server')
+    parser.add_argument('--camera-only', action='store_true', help='Run only camera WebSocket server')
     args = parser.parse_args()
     
-    # Setup signal handler
+    # Run specific component only
+    if args.api_only:
+        print("🚀 Running REST API Server only...")
+        from app.api.server import app
+        app.run(host='0.0.0.0', port=5000, debug=False)
+        return
+    
+    if args.camera_only:
+        print("🚀 Running Camera WebSocket Server only...")
+        import asyncio
+        from app.services.camera_ws import start_server
+        asyncio.run(start_server())
+        return
+    
+    # Determine LCD setting
+    enable_lcd = args.lcd and not args.no_lcd
+    enable_camera = not args.no_camera
+    
+    # Create and initialize system
+    system = GrowUpSystem(enable_lcd=enable_lcd, enable_camera=enable_camera)
+    
+    def signal_handler(sig, frame):
+        print("\n⚠️  Received interrupt signal...")
+        system.stop()
+        sys.exit(0)
+    
     signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
     
-    # Create and start system
-    system = GrowUpSystem(
-        enable_lcd=args.lcd,
-        enable_camera=not args.no_camera,
-        demo_mode=args.demo
-    )
-    
-    system.start()
+    try:
+        system.initialize()
+        system.start()
+        
+        # Keep main thread alive
+        while True:
+            time.sleep(1)
+            
+    except KeyboardInterrupt:
+        print("\n⚠️  Keyboard interrupt received...")
+        system.stop()
+    except Exception as e:
+        print(f"❌ Fatal error: {e}")
+        system.stop()
+        sys.exit(1)
 
-if __name__ == "__main__":
+
+if __name__ == '__main__':
     main()

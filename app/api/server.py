@@ -3,24 +3,25 @@ from flask_cors import CORS
 import time
 import os
 
-# Import camera and sensors from root directory
+# Import camera and sensors from modular structure
 try:
-    from camera_ml import CameraML
+    from app.services.camera_ml import CameraML
 except ImportError:
-    print("⚠️  camera_ml not available - ML features disabled")
+    print("⚠️  camera_ml not available")
     CameraML = None
 
 try:
-    from light_sensor import BH1750
-    from temp_sensor import DS18B20
-    from humidity_sensor import BME280Sensor
-    from water_flow_sensor import FlowSensor
-    from ammonia_sensor import MQ137
-    from ph_sensor import PHSensor
+    from app.sensors import (
+        BH1750,
+        DS18B20,
+        BME280Sensor,
+        FlowSensor,
+        MQ137,
+        PHSensor
+    )
     SENSORS_AVAILABLE = True
 except ImportError as e:
-    print(f"⚠️  Some sensors not available: {e}")
-    print("   Using mock sensor data")
+    print(f"⚠️  Sensors not available: {e}")
     SENSORS_AVAILABLE = False
 
 app = Flask(__name__)
