@@ -1,90 +1,18 @@
-# GrowUp IoT System - Python Dependencies
-# Python 3.9+ required
-#
-# IMPORTANT: Use setup_venv.sh to create a clean virtual environment
-# Or use one of the split requirements files:
-#   pip install -r requirements/base.txt       # Core dependencies
-#   pip install -r requirements/dev.txt        # Development setup
-#   pip install -r requirements/prod.txt       # Production (Raspberry Pi)
-#
-# Manual install: pip install -r requirements.txt
-
-# ==============================================
-# Core Web Framework
-# ==============================================
-Flask==3.0.0
-Flask-CORS==4.0.0
-Werkzeug==3.0.1
-
-# ==============================================
-# HTTP & Networking
-# ==============================================
+# Core dependencies for GrowUp IoT Sensor Agent
 requests==2.31.0
-urllib3==2.1.0
-websockets==12.0
-
-# ==============================================
-# MQTT Client (for device control)
-# ==============================================
 paho-mqtt==1.6.1
-
-# ==============================================
-# Task Scheduling
-# ==============================================
-APScheduler==3.10.4
-pytz==2023.3
-
-# ==============================================
-# Configuration & Environment
-# ==============================================
-python-dotenv==1.0.0
-pydantic==2.5.0
-python-dateutil==2.8.2
-
-# ==============================================
-# Logging
-# ==============================================
-colorlog==6.8.0
-
-# ==============================================
-# Raspberry Pi GPIO & I2C
-# (Install only on Raspberry Pi, or use mock)
-# ==============================================
-# RPi.GPIO==0.7.1           # Uncomment on Raspberry Pi
-smbus2==0.4.3               # Safe to install on any platform
-# spidev==3.6               # Uncomment on Raspberry Pi
-
-# ==============================================
-# Sensor Libraries (Raspberry Pi only)
-# ==============================================
-# adafruit-circuitpython-bme280==2.6.21    # BME280 temp/humidity
-# adafruit-circuitpython-bh1750==1.1.18    # BH1750 light sensor
-# adafruit-circuitpython-ads1x15==2.2.21   # ADS1115 ADC
-# w1thermsensor==2.0.0                     # DS18B20 temp sensor
-
-# ==============================================
-# Camera & Computer Vision
-# ==============================================
+websockets==12.0
 opencv-python==4.8.1.78
 numpy==1.24.3
-Pillow==10.1.0
+ultralytics==8.0.207
 
-# ==============================================
-# Machine Learning (YOLO)
-# Note: ultralytics brings in torch, torchvision, etc.
-# ==============================================
-ultralytics==8.0.196
+# Optional: for Raspberry Pi GPIO support
+# RPi.GPIO==0.7.0
+# adafruit-circuitpython-ads1x15==1.10.1
+# adafruit-circuitpython-dht==4.0.5
 
-# ==============================================
-# Optional: Performance (Production)
-# ==============================================
-# uvloop==0.19.0          # Faster event loop for asyncio
-
-# ==============================================
-# Development Tools (install separately)
-# ==============================================
-# pytest==7.4.3
-# pytest-cov==4.1.0
-# black==23.12.0
-# flake8==6.1.0
-# mypy==1.7.1
+# Development
+pytest==7.4.3
+pytest-cov==4.1.0
+black==23.12.0
+flake8==6.1.0
